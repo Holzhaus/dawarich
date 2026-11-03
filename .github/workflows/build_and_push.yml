@@ -35,7 +35,16 @@ jobs:
 
           IS_PRERELEASE="${{ github.event.release.prerelease }}"
           PLATFORMS="linux/amd64,linux/arm64,linux/arm/v7"
-          MATRIX='{"include":[{"platform":"linux/amd64","runner":"ubuntu-22.04"},{"platform":"linux/arm64","runner":"ubuntu-22.04-arm"},{"platform":"linux/arm/v7","runner":"ubuntu-22.04-arm"}]}'
+          # Two images from docker/Dockerfile: the Distroless app (default
+          # target) and the renderer sidecar it calls for posters and
+          # achievement images. Both are built for every platform.
+          MATRIX=$(jq -cn '
+            [{"platform":"linux/amd64","runner":"ubuntu-22.04"},
+             {"platform":"linux/arm64","runner":"ubuntu-22.04-arm"},
+             {"platform":"linux/arm/v7","runner":"ubuntu-22.04-arm"}] as $platforms
+            | [{"image":"dawarich","target":"runtime"},
+               {"image":"dawarich-renderer","target":"renderer"}] as $images
+            | {include: [$images[] as $i | $platforms[] | . + $i]}')
 
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "is_prerelease=${IS_PRERELEASE}" >> $GITHUB_OUTPUT
@@ -70,9 +79,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-${{ matrix.platform }}-buildx-${{ github.sha }}
+          key: ${{ runner.os }}-${{ matrix.image }}-${{ matrix.platform }}-buildx-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.platform }}-buildx-
+            ${{ runner.os }}-${{ matrix.image }}-${{ matrix.platform }}-buildx-
 
       - name: Install dependencies
         run: npm install
@@ -81,7 +90,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ secrets.DOCKERHUB_USERNAME }}/dawarich
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.image }}
 
       - name: Login to Docker Hub
         uses: docker/login-action@v4.6.0
@@ -101,8 +110,9 @@ jobs:
         with:
           context: .
           file: ./docker/Dockerfile
+          target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/dawarich,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
@@ -121,7 +131,7 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v7
         with:
-          name: digest-${{ steps.platform.outputs.pair }}
+          name: digest-${{ matrix.image }}-${{ steps.platform.outputs.pair }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -130,6 +140,10 @@ jobs:
     permissions:
       contents: read
     needs: [prepare, build-and-push-docker]
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [dawarich, dawarich-renderer]
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout code
@@ -150,13 +164,13 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: ${{ runner.temp }}/digests
-          pattern: digest-*
+          pattern: digest-${{ matrix.image }}-*
           merge-multiple: true
 
       - name: Build Docker tags
         id: docker_tags
         run: |
-          IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/dawarich"
+          IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.image }}"
           VERSION="${{ needs.prepare.outputs.version }}"
           IS_PRERELEASE="${{ needs.prepare.outputs.is_prerelease }}"
 
@@ -181,7 +195,7 @@ jobs:
             TAG_ARGS="${TAG_ARGS} -t ${TAG}"
           done
 
-          SOURCES=$(printf "${{ secrets.DOCKERHUB_USERNAME }}/dawarich@sha256:%s " *)
+          SOURCES=$(printf "${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.image }}@sha256:%s " *)
 
           docker buildx imagetools create ${TAG_ARGS} ${SOURCES}
 

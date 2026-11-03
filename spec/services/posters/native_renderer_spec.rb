@@ -152,5 +152,63 @@ RSpec.describe Posters::NativeRenderer do
 
       expect { build_renderer.call }.to raise_error(described_class::Error, /theme/i)
     end
+
+    it 'explains how to configure the sidecar when the local renderer is missing' do
+      renderer = build_renderer(command: ['/nonexistent/render.sh'])
+
+      expect { renderer.call }.to raise_error(described_class::Error, /RENDERER_URL/)
+    end
+  end
+
+  context 'with the renderer sidecar configured' do
+    before { stub_const('ENV', ENV.to_hash.merge('RENDERER_URL' => 'http://renderer:3100')) }
+
+    def remote_renderer
+      described_class.new(
+        poster: poster, track: track, distance: 15_000, route_opacity: 0.6, subtitle: '1 Oct 2025 – 31 Oct 2025'
+      )
+    end
+
+    it 'sends the job to the sidecar and returns the decoded PNG and PDF' do
+      request = stub_request(:post, 'http://renderer:3100/posters')
+                .with { |req| JSON.parse(req.body).dig('tokens', 'name') == 'Autumn' }
+                .to_return(status: 200, body: { png: ['PNG-bytes'].pack('m0'), pdf: ['PDF-bytes'].pack('m0') }.to_json)
+
+      expect(remote_renderer.call).to eq(png: 'PNG-bytes', pdf: 'PDF-bytes')
+      expect(request).to have_been_made.once
+    end
+
+    it 'asks for a PDF and carries the view and text in the job' do
+      stub_request(:post, 'http://renderer:3100/posters')
+        .to_return(status: 200, body: { png: '', pdf: '' }.to_json)
+
+      remote_renderer.call
+
+      expect(
+        a_request(:post, 'http://renderer:3100/posters').with do |req|
+          job = JSON.parse(req.body)
+          job['output']['pdf'].present? && job['view']['distance'] == 15_000 && job['text']['title'] == 'Berlin'
+        end
+      ).to have_been_made
+    end
+
+    it 'raises with the sidecar error message when rendering fails' do
+      stub_request(:post, 'http://renderer:3100/posters')
+        .to_return(status: 500, body: { error: 'GL context lost' }.to_json)
+
+      expect { remote_renderer.call }.to raise_error(described_class::Error, /GL context lost/)
+    end
+
+    it 'raises a timeout error when the sidecar does not answer in time' do
+      stub_request(:post, 'http://renderer:3100/posters').to_timeout
+
+      expect { remote_renderer.call }.to raise_error(described_class::Error, /timed out after 180 seconds/)
+    end
+
+    it 'raises when the sidecar is unreachable' do
+      stub_request(:post, 'http://renderer:3100/posters').to_raise(Errno::ECONNREFUSED)
+
+      expect { remote_renderer.call }.to raise_error(described_class::Error, /unavailable/)
+    end
   end
 end

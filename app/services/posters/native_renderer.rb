@@ -4,10 +4,11 @@ require 'open3'
 require 'timeout'
 
 module Posters
-  # Renders a poster in-process via the vendored maplibre-native Node
-  # renderer (vendor/poster_renderer) — the same style and typography
-  # modules the browser studio runs, fed by the existing vector tiles.
-  # Seconds instead of the sidecar's minutes.
+  # Renders a poster via the vendored maplibre-native Node renderer
+  # (vendor/poster_renderer) — the same style and typography modules the
+  # browser studio runs, fed by the existing vector tiles. Runs it as a local
+  # command, or through the renderer sidecar when RENDERER_URL is set (the
+  # Distroless app image has no Node or GL stack).
   class NativeRenderer
     class Error < StandardError; end
 
@@ -25,10 +26,13 @@ module Posters
       @route_opacity = route_opacity
       @route_width = route_width
       @subtitle = subtitle
+      @remote = command.nil? && RendererSidecar.configured?
       @command = command || default_command
     end
 
     def call
+      return render_remote if @remote
+
       Dir.mktmpdir('poster_render') do |dir|
         job_path = File.join(dir, 'job.json')
         png_path = File.join(dir, 'poster.png')
@@ -81,6 +85,23 @@ module Posters
       JSON.parse(path.read)
     end
 
+    # The sidecar writes the outputs to its own temp dir and returns them
+    # base64-encoded; the paths sent here only signal that a PDF is wanted.
+    def render_remote
+      body = RendererSidecar.post(
+        '/posters', JSON.generate(job('poster.png', 'poster.pdf')),
+        content_type: 'application/json', timeout: RENDER_TIMEOUT
+      )
+      result = JSON.parse(body)
+      { png: result.fetch('png').unpack1('m'), pdf: result.fetch('pdf').unpack1('m') }
+    rescue RendererSidecar::Error => e
+      raise Error, "Poster renderer failed: #{e.message}"
+    rescue Timeout::Error
+      raise Error, "Poster renderer timed out after #{RENDER_TIMEOUT} seconds"
+    rescue SystemCallError, JSON::ParserError, KeyError, TypeError => e
+      raise Error, "Poster renderer unavailable: #{e.message}"
+    end
+
     def run_renderer(job_path)
       stdout = stderr = status = nil
 
@@ -104,6 +125,9 @@ module Posters
       return if status.success?
 
       raise Error, "Poster renderer failed (#{status.exitstatus}): #{stderr.presence || stdout}".strip
+    rescue Errno::ENOENT, Errno::EACCES => e
+      raise Error, "Poster renderer not available (#{e.message}). In the Docker image, set RENDERER_URL " \
+                   'to the dawarich_renderer service.'
     end
 
     def terminate_process_group(wait_thread, readers)

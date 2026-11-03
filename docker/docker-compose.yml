@@ -1,6 +1,29 @@
 # full list of environment variables with descriptions can be found in the documentation:
 # https://dawarich.app/docs/self-hosting/environment-variables/
 
+# Shared by dawarich_init and dawarich_app, which must agree on the database
+# and Rails settings.
+x-dawarich-environment: &dawarich-environment
+  RAILS_ENV: ${RAILS_ENV:-production}
+  REDIS_URL: ${REDIS_URL:-redis://dawarich_redis:6379}
+  DATABASE_HOST: ${DATABASE_HOST:-dawarich_db}
+  DATABASE_PORT: ${DATABASE_PORT:-5432}
+  DATABASE_USERNAME: ${DATABASE_USERNAME:-postgres}
+  DATABASE_PASSWORD: ${DATABASE_PASSWORD:-password}
+  DATABASE_NAME: ${DATABASE_NAME:-dawarich_development}
+  APPLICATION_HOSTS: ${APPLICATION_HOSTS:-localhost,::1,127.0.0.1}
+  TIME_ZONE: ${TIME_ZONE:-Europe/London}
+  APPLICATION_PROTOCOL: ${APPLICATION_PROTOCOL:-http}
+  PROMETHEUS_EXPORTER_ENABLED: ${PROMETHEUS_EXPORTER_ENABLED:-false}
+  SECRET_KEY_BASE: ${SECRET_KEY_BASE:-"CHANGE_ME"}
+  RAILS_LOG_TO_STDOUT: ${RAILS_LOG_TO_STDOUT:-true}
+  SELF_HOSTED: ${SELF_HOSTED:-true}
+  STORE_GEODATA: ${STORE_GEODATA:-true}
+  ### OTP encryption keys are required if you want to use 2FA
+  # OTP_ENCRYPTION_PRIMARY_KEY: ${OTP_ENCRYPTION_PRIMARY_KEY:-}
+  # OTP_ENCRYPTION_DETERMINISTIC_KEY: ${OTP_ENCRYPTION_DETERMINISTIC_KEY:-}
+  # OTP_ENCRYPTION_KEY_DERIVATION_SALT: ${OTP_ENCRYPTION_KEY_DERIVATION_SALT:-}
+
 networks:
   dawarich:
 
@@ -48,9 +71,62 @@ services:
       timeout: 10s
     # command: postgres -c config_file=/etc/postgresql/postgresql.conf # Use custom config, uncomment if you want to use a custom config
 
+  # One-shot setup, run before every start of dawarich_app. Starts as root
+  # only to give the volumes to PUID:PGID, then drops to that user to sync
+  # static assets and create, migrate and seed the database, and exits.
+  dawarich_init:
+    image: freikin/dawarich:latest
+    container_name: dawarich_init
+    user: "0:0"
+    entrypoint: ["dawarich-entrypoint", "init"]
+    volumes:
+      - dawarich_public:/var/app/public
+      - dawarich_watched:/var/app/tmp/imports/watched
+      - dawarich_storage:/var/app/storage
+    networks:
+      - dawarich
+    environment:
+      <<: *dawarich-environment
+      ### The user dawarich_app runs as; keep in sync with its `user:` below.
+      PUID: ${PUID:-65532}
+      PGID: ${PGID:-65532}
+    restart: "no"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      dawarich_db:
+        condition: service_healthy
+
+  # Renders posters and achievement share images for dawarich_app. Do not
+  # publish its port: it has no authentication.
+  dawarich_renderer:
+    image: freikin/dawarich-renderer:latest
+    container_name: dawarich_renderer
+    networks:
+      - dawarich
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: [ "CMD", "node", "-e", "fetch('http://127.0.0.1:3100/health').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))" ]
+      interval: 30s
+      retries: 3
+      start_period: 10s
+      timeout: 10s
+
   dawarich_app:
     image: freikin/dawarich:latest
     container_name: dawarich_app
+    ### Runs as a non-root user. To use another one, set PUID/PGID (e.g. in
+    ### .env); dawarich_init gives the volumes to the same user.
+    user: "${PUID:-65532}:${PGID:-65532}"
     volumes:
       - dawarich_public:/var/app/public
       - dawarich_watched:/var/app/tmp/imports/watched
@@ -62,54 +138,41 @@ services:
       - "${DAWARICH_APP_PORT:-3000}:3000"
     stdin_open: true
     tty: true
-    entrypoint: web-entrypoint.sh
+    entrypoint: ["dawarich-entrypoint", "run"]
     command: ['bin/rails', 'server', '-p', '3000', '-b', '::']
     restart: unless-stopped
     stop_grace_period: 60s
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
     environment:
-      RAILS_ENV: ${RAILS_ENV:-production}
-      ### To run under a non-root user, set PUID/PGID here (do NOT use `user:`).
-      # PUID: ${PUID:-1000}
-      # PGID: ${PGID:-1000}
-      REDIS_URL: ${REDIS_URL:-redis://dawarich_redis:6379}
-      DATABASE_HOST: ${DATABASE_HOST:-dawarich_db}
-      DATABASE_PORT: ${DATABASE_PORT:-5432}
-      DATABASE_USERNAME: ${DATABASE_USERNAME:-postgres}
-      DATABASE_PASSWORD: ${DATABASE_PASSWORD:-password}
-      DATABASE_NAME: ${DATABASE_NAME:-dawarich_development}
-      APPLICATION_HOSTS: ${APPLICATION_HOSTS:-localhost,::1,127.0.0.1}
-      TIME_ZONE: ${TIME_ZONE:-Europe/London}
-      APPLICATION_PROTOCOL: ${APPLICATION_PROTOCOL:-http}
-      PROMETHEUS_EXPORTER_ENABLED: ${PROMETHEUS_EXPORTER_ENABLED:-false}
-      SECRET_KEY_BASE: ${SECRET_KEY_BASE:-"CHANGE_ME"}
-      RAILS_LOG_TO_STDOUT: ${RAILS_LOG_TO_STDOUT:-true}
-      SELF_HOSTED: ${SELF_HOSTED:-true}
-      STORE_GEODATA: ${STORE_GEODATA:-true}
+      <<: *dawarich-environment
       SIDEKIQ_EMBEDDED: 'true'
       WEB_CONCURRENCY: '0'
       BACKGROUND_PROCESSING_CONCURRENCY: ${BACKGROUND_PROCESSING_CONCURRENCY:-2}
-      ### OTP encryption keys are required if you want to use 2FA
-      # OTP_ENCRYPTION_PRIMARY_KEY: ${OTP_ENCRYPTION_PRIMARY_KEY:-}
-      # OTP_ENCRYPTION_DETERMINISTIC_KEY: ${OTP_ENCRYPTION_DETERMINISTIC_KEY:-}
-      # OTP_ENCRYPTION_KEY_DERIVATION_SALT: ${OTP_ENCRYPTION_KEY_DERIVATION_SALT:-}
+      RENDERER_URL: ${RENDERER_URL:-http://dawarich_renderer:3100}
     logging:
       driver: "json-file"
       options:
         max-size: ${LOG_MAX_SIZE:-100m}
         max-file: ${LOG_MAX_FILE:-5}
     healthcheck:
-      test: [ "CMD-SHELL", "wget -qO - http://127.0.0.1:3000/api/v1/health | grep -q '\"status\"\\s*:\\s*\"ok\"'" ]
+      test: [ "CMD", "dawarich-healthcheck" ]
       interval: 10s
       retries: 30
       start_period: 30s
       timeout: 10s
     depends_on:
+      dawarich_init:
+        condition: service_completed_successfully
       dawarich_db:
         condition: service_healthy
         restart: true
       dawarich_redis:
         condition: service_healthy
         restart: true
+      dawarich_renderer:
+        condition: service_started
     deploy:
       resources:
         limits:

@@ -23,6 +23,8 @@ module Achievements
     end
 
     def call
+      return render_remote if RendererSidecar.configured?
+
       svg_data = svg
       command = [CONVERTER, '-f', 'png', '-w', WIDTH.to_s, '-h', HEIGHT.to_s]
       Open3.popen3(*command, pgroup: true) do |stdin, stdout, stderr, wait_thr|
@@ -62,6 +64,17 @@ module Achievements
     end
 
     private
+
+    # The Distroless app image has no rsvg-convert; the renderer sidecar runs
+    # it. Timeouts surface as Net::OpenTimeout / Net::ReadTimeout, which are
+    # Timeout::Error like the local path's.
+    def render_remote
+      RendererSidecar.post(
+        "/svg?width=#{WIDTH}&height=#{HEIGHT}", svg, content_type: 'image/svg+xml', timeout: RENDER_TIMEOUT
+      )
+    rescue RendererSidecar::Error => e
+      raise "Achievement OG image render failed: #{e.message}"
+    end
 
     def attributes
       @attributes ||= @set.card_attributes

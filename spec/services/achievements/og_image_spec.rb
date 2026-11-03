@@ -62,6 +62,31 @@ RSpec.describe Achievements::OgImage do
     end
   end
 
+  context 'with the renderer sidecar configured' do
+    before { stub_const('ENV', ENV.to_hash.merge('RENDERER_URL' => 'http://renderer:3100/')) }
+
+    it 'converts the card SVG through the sidecar at OG size' do
+      stub_request(:post, 'http://renderer:3100/svg?width=1200&height=630')
+        .with(headers: { 'Content-Type' => 'image/svg+xml' }) { |req| req.body.include?('Germany Explorer') }
+        .to_return(status: 200, body: 'PNG-bytes')
+
+      expect(described_class.new(set).call).to eq('PNG-bytes')
+    end
+
+    it 'raises when the sidecar fails' do
+      stub_request(:post, 'http://renderer:3100/svg?width=1200&height=630')
+        .to_return(status: 500, body: { error: 'bad svg' }.to_json)
+
+      expect { described_class.new(set).call }.to raise_error(/render failed: 500 bad svg/)
+    end
+
+    it 'raises a timeout error like the local converter' do
+      stub_request(:post, 'http://renderer:3100/svg?width=1200&height=630').to_timeout
+
+      expect { described_class.new(set).call }.to raise_error(Timeout::Error)
+    end
+  end
+
   it 'terminates a renderer that exceeds its timeout' do
     Dir.mktmpdir do |dir|
       pid_file = File.join(dir, 'renderer.pid')

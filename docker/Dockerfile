@@ -99,57 +99,138 @@ RUN if [ "$(uname -m)" = "x86_64" ] || [ "$(uname -m)" = "aarch64" ]; then \
 RUN SECRET_KEY_BASE_DUMMY=1 bundle exec rake assets:precompile \
     && rm -rf node_modules tmp/cache
 
-# Ensure tmp directory exists and is writable by any user (for custom uid:gid support)
-RUN mkdir -p tmp/pids tmp/cache tmp/sockets \
-    && chmod -R 777 tmp
-
 # Stage a pristine copy of public/ for the entrypoint to sync into the
 # persistent volume at runtime. Lives under the app dir, not /tmp, so
 # tmpfs-mounted /tmp cannot make the sync silently skip.
 RUN cp -r public $APP_PATH/public_dist
 
 # ---------------------------------------------------------------------------
-# runtime: only what is needed to run Rails, Sidekiq and the poster renderer.
-# No compilers, git, curl, npm or -dev packages.
+# app-files: the application tree as the app image ships it. The renderer's
+# node_modules live in the renderer image, and the test suite is not needed.
+# Writable paths belong to the image's non-root user (65532, Distroless
+# "nonroot"); tmp and log are also world-writable so a custom PUID works.
+# There is no shell in the final image, so permissions are set here.
 # ---------------------------------------------------------------------------
-FROM base AS runtime
+FROM build AS app-files
 
-# wget is kept for the compose healthcheck; psql/createdb for the entrypoints;
-# gosu for the PUID/PGID privilege drop.
+RUN rm -rf vendor/poster_renderer/node_modules spec \
+    && mkdir -p tmp/pids tmp/cache tmp/sockets tmp/imports/watched log storage \
+    && chown -R 65532:65532 public storage tmp log \
+    && chmod -R 1777 tmp log
+
+# ---------------------------------------------------------------------------
+# runtime-libs: collects the shared libraries Ruby and the native gems link
+# against, plus the entrypoint files, into /rootfs for the Distroless image.
+# glibc, libstdc++, libgcc and OpenSSL come from the Distroless base instead.
+# The one extra binary is coreutils' env (glibc only, not a shell): the app's
+# bin/* binstubs start with `#!/usr/bin/env ruby`, so without it
+# `docker exec dawarich_app bin/rails console` would fail.
+# ---------------------------------------------------------------------------
+FROM base AS runtime-libs
+
 RUN apt-get update -qq \
     && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    wget \
-    postgresql-client \
     libpq5 \
     libxml2 \
     libxslt1.1 \
     libyaml-0-2 \
     libgeos-c1t64 \
-    libcurl4t64 \
-    tzdata \
     libjemalloc2 \
-    ca-certificates \
-    librsvg2-bin fonts-dejavu-core fonts-noto-cjk \
-    gosu \
     && rm -rf /var/lib/apt/lists/*
 
-# Node runs the poster renderer; npm is only needed at build time.
-COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=build $APP_PATH/vendor/bundle $APP_PATH/vendor/bundle
 
-# Headless GL stack for the in-container poster renderer (maplibre-native):
-# software rendering via Mesa + a virtual X display. No browser involved.
+# Fails the build if any library is missing, so a gem that gains a new native
+# dependency cannot ship an image that crashes at boot.
+RUN set -eu; \
+    jemalloc="$(ls /usr/lib/*/libjemalloc.so.2)"; \
+    find /usr/local/bin/ruby /usr/local/lib $APP_PATH/vendor/bundle -type f \
+      \( -name ruby -o -name '*.so' -o -name '*.so.*' \) > /tmp/elf-files; \
+    echo "$jemalloc" >> /tmp/elf-files; \
+    xargs -a /tmp/elf-files ldd 2>/dev/null > /tmp/ldd.out || true; \
+    if grep -q 'not found' /tmp/ldd.out; then grep 'not found' /tmp/ldd.out; exit 1; fi; \
+    { awk '$2 == "=>" && $3 ~ /^\// { print $3 }' /tmp/ldd.out; echo "$jemalloc"; } \
+      | sort -u \
+      | grep -vE '/(libc|libm|libdl|libpthread|librt|libresolv|libgcc_s|libstdc\+\+|libssl|libcrypto)\.so|/ld-linux' \
+      | grep -v '^/usr/local/' \
+      | while read -r lib; do \
+          dir="$(readlink -f "$(dirname "$lib")")"; \
+          mkdir -p "/rootfs$dir"; \
+          cp -L "$lib" "/rootfs$dir/$(basename "$lib")"; \
+        done; \
+    mkdir -p /rootfs/etc /rootfs/usr/bin; \
+    if ldd /usr/bin/env | awk '$2 == "=>" { print $1 }' | grep -vqE '^(libc|ld-linux)'; then \
+      echo "/usr/bin/env links more than glibc"; exit 1; \
+    fi; \
+    cp /usr/bin/env /rootfs/usr/bin/env; \
+    echo "$(readlink -f "$(dirname "$jemalloc")")/libjemalloc.so.2" > /rootfs/etc/ld.so.preload; \
+    ldconfig && cp /etc/ld.so.cache /rootfs/etc/ld.so.cache
+
+# One Ruby entrypoint replaces the shell scripts; the old names stay as
+# symlinks so compose files that reference them keep working.
+COPY --chmod=755 ./docker/entrypoint.rb /rootfs/usr/local/bin/dawarich-entrypoint
+COPY --chmod=755 ./docker/healthcheck.rb /rootfs/usr/local/bin/dawarich-healthcheck
+RUN for name in web-entrypoint.sh sidekiq-entrypoint.sh cloud-entrypoint.sh; do \
+      ln -s dawarich-entrypoint "/rootfs/usr/local/bin/$name"; \
+    done
+
+# ---------------------------------------------------------------------------
+# renderer: sidecar image for posters and achievement share images (Node,
+# maplibre-native, Mesa, a virtual X display and rsvg-convert). The app image
+# calls it over HTTP via RENDERER_URL. Build with --target renderer.
+# ---------------------------------------------------------------------------
+FROM debian:trixie-slim AS renderer
+
 RUN apt-get update -qq \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libcurl4t64 \
+    librsvg2-bin fonts-dejavu-core fonts-noto-cjk \
     libegl1 libgles2 libgbm1 libglx0 libopengl0 libx11-6 xvfb xauth \
     && (apt-get install -y --no-install-recommends mesa-libgallium 2>/dev/null || true) \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -m 1777 -p /tmp/.X11-unix
 
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=mbgl_libs /out /opt/mbgl-libs
 
-# Preload jemalloc from this architecture's multiarch lib dir
-# (x86_64-linux-gnu, aarch64-linux-gnu, arm-linux-gnueabihf).
-RUN ls /usr/lib/*/libjemalloc.so.2 > /etc/ld.so.preload
+# render.mjs imports the app's own poster_studio modules (see loader.mjs), so
+# keep the app's directory layout.
+WORKDIR /var/app
+COPY --from=build /var/app/app/javascript app/javascript
+COPY --from=build /var/app/vendor/poster_renderer vendor/poster_renderer
+
+# Vendored Ubuntu libs for the maplibre-native binding; the server strips
+# this for rsvg-convert.
+ENV LD_LIBRARY_PATH=/opt/mbgl-libs
+ENV HOME=/tmp
+ENV PORT=3100
+
+USER 65532:65532
+
+EXPOSE 3100
+
+ENTRYPOINT ["xvfb-run", "-a", "node", "vendor/poster_renderer/server.mjs"]
+
+# ---------------------------------------------------------------------------
+# runtime (default target): Distroless. No shell, package manager, compilers
+# or coreutils; runs as the non-root user 65532. Ruby comes from the official
+# image, the gems' shared libraries from runtime-libs.
+# ---------------------------------------------------------------------------
+FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
+
+ENV LANG=C.UTF-8
+ENV GEM_HOME=/usr/local/bundle
+ENV BUNDLE_APP_CONFIG=/usr/local/bundle
+ENV BUNDLE_SILENCE_ROOT_WARNING=1
+ENV PATH=/usr/local/bundle/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV APP_PATH=/var/app
+ENV RAILS_LOG_TO_STDOUT=true
+ENV RAILS_PORT=3000
+# Bundler and friends need a writable home; any PUID can write /tmp.
+ENV HOME=/tmp
 
 # Return freed pages to the OS quickly instead of holding them in the
 # allocator, and cap arena count — keeps idle RSS low on small hosts.
@@ -158,15 +239,17 @@ ENV MALLOC_CONF="narenas:2,dirty_decay_ms:1000,muzzy_decay_ms:1000"
 # Enable YJIT
 ENV RUBY_YJIT_ENABLE=1
 
-# Application, installed gems (vendor/bundle) and precompiled assets
-COPY --from=build $APP_PATH $APP_PATH
+COPY --from=base /usr/local/bin /usr/local/bin
+COPY --from=base /usr/local/lib /usr/local/lib
 # The base image points BUNDLE_APP_CONFIG at /usr/local/bundle, so the
 # `bundle config --local` settings (path, without) live here, not in .bundle/.
-COPY --from=build /usr/local/bundle/config /usr/local/bundle/config
+COPY --from=build /usr/local/bundle /usr/local/bundle
+COPY --from=runtime-libs /rootfs/ /
+COPY --from=app-files $APP_PATH $APP_PATH
 
-# Entrypoint scripts
-COPY --chmod=755 ./docker/entrypoint-env-guard.sh ./docker/web-entrypoint.sh \
-    ./docker/sidekiq-entrypoint.sh ./docker/cloud-entrypoint.sh /usr/local/bin/
+WORKDIR $APP_PATH
+
+USER 65532:65532
 
 EXPOSE $RAILS_PORT
 

@@ -1,8 +1,5 @@
 # Trivy ignore file
 #
-# AVD-DS-0002 — "Image user should not be 'root'"
-# The container image intentionally starts as root and drops privileges at
-# runtime via gosu in docker/web-entrypoint.sh and docker/sidekiq-entrypoint.sh
-# to support the optional PUID/PGID file-ownership feature. A static USER
-# directive would break that runtime user switching, so this rule is suppressed.
-AVD-DS-0002
+# No suppressions. AVD-DS-0002 ("Image user should not be 'root'") used to be
+# ignored because the image started as root and dropped privileges via gosu;
+# both the app and renderer images now run as the non-root user 65532.

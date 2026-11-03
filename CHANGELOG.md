@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## [Unreleased]
+
+### ⚠️ Upgrade notes
+
+**Distroless image.** The `freikin/dawarich` image is now based on Distroless: it has no shell, package manager or command-line tools, and runs as the non-root user 65532. Posters and achievement share images are rendered by a new `freikin/dawarich-renderer` image. Download the current `docker/docker-compose.yml` and carry over your settings; it adds three things:
+
+- A `dawarich_init` service that runs before the app on every start. It starts as root only to give the volumes to the app user, then drops to that user to sync assets and migrate and seed the database, and exits.
+- A `dawarich_renderer` service. The app reaches it through `RENDERER_URL`. Do not publish its port.
+- The app runs with `user: "${PUID:-65532}:${PGID:-65532}"`. To run as another user, set `PUID` and `PGID` (for example in `.env`); `dawarich_init` and the app read the same values. Setting `PUID`/`PGID` in the app's `environment:` no longer has an effect.
+
+If you keep an older compose file:
+
+- The app stops at startup with "is not writable by uid 65532", because volumes created by earlier versions belong to root. Adding `user: "0:0"` to the app service restores the previous behaviour (fix ownership, then drop to `PUID:PGID`, default 65532), but the app then starts as root; switching to the new compose file is recommended.
+- Healthchecks that run a shell command (`CMD-SHELL`, `wget`, `curl`) fail. Use `test: ["CMD", "dawarich-healthcheck"]`.
+- Without `RENDERER_URL`, poster rendering and achievement share images fail.
+- Commands that relied on a shell inside the container, such as `docker exec -it dawarich_app sh` or `bash`, no longer work. `docker exec -it dawarich_app bin/rails console` still does.
+
+### Changed
+
+- The Docker image is based on Distroless and runs as a non-root user. It no longer contains a shell, package manager, compilers, git, curl, wget, psql or Node. The entrypoints are rewritten in Ruby; `web-entrypoint.sh`, `sidekiq-entrypoint.sh` and `cloud-entrypoint.sh` remain as aliases.
+- Poster rendering and achievement share images run in the new `dawarich-renderer` image, which the app calls over HTTP.
+
 ## [1.20.1] - 2026-11-01, Berlin
 
 ### Fixed
